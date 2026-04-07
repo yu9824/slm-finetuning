@@ -48,6 +48,7 @@ graph TB
 
     subgraph Core[src]
         ConfigManager[ConfigManager]
+        TrainingCore[TrainingCore]
         ModelLoader[ModelLoader]
         DatasetProcessor[DatasetProcessor]
         OfflineGuard[OfflineGuard]
@@ -68,12 +69,13 @@ graph TB
     end
 
     TrainScript --> ConfigManager
-    TrainScript --> ModelLoader
-    TrainScript --> DatasetProcessor
+    TrainScript --> TrainingCore
     TrainScript --> OfflineGuard
     HPOScript --> ConfigManager
-    HPOScript --> ModelLoader
-    HPOScript --> DatasetProcessor
+    HPOScript --> TrainingCore
+    HPOScript --> OfflineGuard
+    TrainingCore --> ModelLoader
+    TrainingCore --> DatasetProcessor
     InferScript --> ModelLoader
     ConvertScript --> LlamaCpp
 
@@ -198,7 +200,7 @@ flowchart TB
 | 3.1 | LoraConfig パラメータ設定 | ModelLoader | `apply_lora()` | — |
 | 3.2 | QLoRA オプション | ModelLoader | — | — |
 | 3.3 | ベースモデル凍結 | ModelLoader | — | — |
-| 3.4 | SFTTrainer による学習 | FineTuner（train.py） | — | 学習パイプライン |
+| 3.4 | SFTTrainer による学習 | TrainingCore | `run_training_trial()` | 学習パイプライン |
 | 3.5 | GPU 自動利用 / CPU フォールバック | ModelLoader | — | — |
 | 4.1 | YAML/JSON 設定ファイル読み込み | ConfigManager | `load()` | 全スクリプト共通 |
 | 4.2 | CLI 引数優先 | ConfigManager | — | — |
@@ -221,7 +223,7 @@ flowchart TB
 | 7.5 | data/README.md | data/README.md | — | — |
 | 8.1 | Optuna / Ray Tune 切り替え | HPORunner | `run()` | HPO フロー |
 | 8.2 | 探索空間定義 | HPORunner | `define_search_space()` | — |
-| 8.3 | 評価指標として eval loss 使用 | HPORunner | — | — |
+| 8.3 | 評価指標として eval loss 使用 | TrainingCore, HPORunner | `run_training_trial()` | HPO フロー |
 | 8.4 | 最良パラメータのファイル出力 | HPORunner | — | — |
 | 8.5 | Ray Tune 並列探索 | HPORunner | — | — |
 | 8.6 | n_trials 引数 | HPORunner | — | — |
@@ -254,10 +256,11 @@ flowchart TB
 |--------------|---------|------|--------------|-------------------|------|
 | OfflineGuard | src/utils | 環境変数強制・外部接続防止 | 1.4, 1.5, 9.6, 9.7, 11.5 | なし | サービス |
 | ConfigManager | src/training | YAML 設定読み込み・CLI 優先・スナップショット保存 | 4.1〜4.4, 9.4 | PyYAML, argparse | サービス |
+| TrainingCore | src/training | 学習ループのコアロジック（train.py と hpo.py が共有） | 3.4, 8.3 | trl, transformers | サービス |
 | ModelLoader | src/model | ローカルモデル/トークナイザーロード・LoRA/QLoRA 適用 | 1.1〜1.3, 3.1〜3.3, 3.5 | transformers, peft, bitsandbytes | サービス |
-| DatasetProcessor | src/data | JSONL 読み込み・チャットテンプレート適用・トランケート | 2.1〜2.5 | transformers, datasets | サービス |
-| FineTuner | scripts/train.py | 学習ループのオーケストレーション・チェックポイント管理 | 3.4, 5.1〜5.4, 9.1〜9.4, 10.1 | trl, transformers | バッチ |
-| HPORunner | scripts/hpo.py | HPO オーケストレーション（Optuna / Ray Tune） | 8.1〜8.8 | optuna, ray[tune] | バッチ |
+| DatasetProcessor | src/data | JSONL 読み込み・messages 形式 Dataset への変換 | 2.1〜2.5 | datasets | サービス |
+| FineTuner | scripts/train.py | 学習パイプラインのエントリポイント・チェックポイント管理 | 5.1〜5.4, 9.1〜9.4, 10.1 | TrainingCore | バッチ |
+| HPORunner | scripts/hpo.py | HPO オーケストレーション（Optuna / Ray Tune） | 8.1〜8.8 | TrainingCore, optuna, ray[tune] | バッチ |
 | InferenceRunner | scripts/inference.py | アダプター読み込みと推論実行 | 10.2, 10.3 | transformers, peft | サービス |
 | GGUFConverter | scripts/convert_to_gguf.py | GGUF 変換・Modelfile 生成 | 6.1〜6.6 | llama.cpp（外部） | バッチ |
 | DummyDataset | data/ | 動作確認用日本語サンプルデータ | 7.1〜7.5 | — | — |
@@ -379,6 +382,56 @@ def save_config_snapshot(config: TrainConfig, output_dir: str) -> None:
 
 ---
 
+#### TrainingCore
+
+| フィールド | 詳細 |
+|-----------|------|
+| Intent | `train.py` と `hpo.py` が共有する学習ループのコアロジックを提供し、ロジック重複とスクリプト間の乖離を防ぐ |
+| 要件 | 3.4, 8.3 |
+
+**責務と制約**
+- `run_training_trial()` を公開し、`TrainConfig` を受け取って SFTTrainer を実行し eval loss を返す
+- `train.py`（フルトレーニング）と `hpo.py`（HPO トライアル）の両方から呼び出される
+- チェックポイント保存・アダプターエクスポートなどの後処理は呼び出し元（`train.py`）が担当し、このコンポーネントは学習ループ実行と評価指標返却に専念する
+
+**依存関係**
+- 内部: ModelLoader — モデル/トークナイザーのロード（P0）
+- 内部: DatasetProcessor — messages Dataset の生成（P0）
+- 外部: `trl` — `SFTTrainer`, `SFTConfig`（P0）
+
+**契約**: サービス [x]
+
+##### サービスインターフェース（Python）
+```python
+from dataclasses import dataclass
+
+@dataclass
+class TrialResult:
+    eval_loss: float
+    model_path: str  # 学習済みアダプターの保存先
+
+def run_training_trial(config: TrainConfig) -> TrialResult:
+    """
+    TrainConfig に基づきモデルロード・データ準備・SFTTrainer 実行を行い、
+    eval_loss を含む TrialResult を返す。
+    train.py からはフルトレーニングとして、hpo.py からは各トライアルとして呼び出される。
+
+    Raises:
+        FileNotFoundError: model_path が存在しない場合
+        RuntimeError: 学習中にエラーが発生した場合
+    """
+    ...
+```
+- 事前条件: `OfflineGuard.enforce_offline()` が呼び出し済みであること；`config.data.eval_file` が指定されていること（eval loss 計算のため）
+- 事後条件: `TrialResult.eval_loss` に検証セット loss が格納されている；アダプターが `config.output_dir` に保存されている
+- 不変条件: `SFTConfig(max_seq_length=config.data.max_length)` によりトランケートを SFTTrainer に委任する
+
+**実装ノート**
+- 統合: 内部で `ModelLoader.load_model_and_tokenizer(gradient_checkpointing=config.gradient_checkpointing)` を呼び出すことで、QLoRA 互換性対処が自動的に適用される
+- 統合: `DatasetProcessor.load_and_process_dataset()` で取得した messages 形式 Dataset を SFTTrainer に直接渡す
+
+---
+
 ### src/model レイヤー
 
 #### ModelLoader
@@ -410,9 +463,11 @@ def load_model_and_tokenizer(
     model_path: str,
     lora_config: LoRAConfig,
     use_qlora: bool = False,
+    gradient_checkpointing: bool = False,
 ) -> tuple[PreTrainedModel, PreTrainedTokenizer]:
     """
     ローカルパスからモデルとトークナイザーをロードし、LoRA（オプションで QLoRA）を適用する。
+    QLoRA + gradient_checkpointing の互換性対処（enable_input_require_grads）も内部で実施する。
 
     Raises:
         FileNotFoundError: model_path にモデルファイルが存在しない場合
@@ -429,13 +484,13 @@ def merge_and_save(
     ...
 ```
 - 事前条件: `model_path` にモデルの重みファイルが存在すること；`OfflineGuard.enforce_offline()` が呼び出し済みであること
-- 事後条件: 返されるモデルは LoRA アダプター適用済み・ベースモデルパラメータ凍結済み
+- 事後条件: 返されるモデルは LoRA アダプター適用済み・ベースモデルパラメータ凍結済み；`gradient_checkpointing=True` かつ `use_qlora=True` の場合は `enable_input_require_grads()` 適用済み
 - 不変条件: QLoRA 使用時は `device_map="auto"` が強制設定される
 
 **実装ノート**
 - 統合: `use_qlora=True` の場合、`BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)` を `from_pretrained` に渡す
+- 統合: `gradient_checkpointing=True` かつ `use_qlora=True` の場合、LoRA 適用後に `model.enable_input_require_grads()` を呼び出すことで gradient_checkpointing との互換性を保証する。この処理を ModelLoader に集約し、呼び出し元への漏れを防ぐ
 - バリデーション: `model_path` の存在確認は `Path(model_path).exists()` で実施し、`FileNotFoundError` を raise
-- リスク: QLoRA + gradient_checkpointing の併用時に互換性問題が発生する可能性。`model.enable_input_require_grads()` の追加で対処
 
 ---
 
@@ -445,35 +500,32 @@ def merge_and_save(
 
 | フィールド | 詳細 |
 |-----------|------|
-| Intent | JSONL データセットを読み込み、sarashina-2.2 のチャットテンプレートに従ってトークナイズする |
+| Intent | JSONL データセットを読み込み、SFTTrainer が直接消費できる messages 形式の Dataset に変換する |
 | 要件 | 2.1, 2.2, 2.3, 2.4, 2.5 |
 
 **責務と制約**
 - JSONL ファイルの読み込みと各サンプルの検証（`instruction`, `output` の存在確認）
-- `instruction` / `input` / `output` フィールドを `messages` リストに変換
-- `tokenizer.apply_chat_template()` を使用してチャットテンプレートを適用
-- `max_length` を超えるシーケンスのトランケート
+- `instruction` / `input` / `output` フィールドを `{"messages": [...]}` 形式（role/content リスト）に変換
 - 必須フィールド欠落サンプルのスキップとログ警告
+- トークナイズは SFTTrainer に委任し、`max_length` は `SFTConfig(max_seq_length=...)` で制御する
+- 事前トークナイズは行わない（二重トークナイズを防止）
 
 **依存関係**
-- 外部: `transformers` — `PreTrainedTokenizer`（P0）
-- 外部: `datasets` — `Dataset`（P1）
+- 外部: `datasets` — `Dataset`（P0）
 
 **契約**: サービス [x]
 
 ##### サービスインターフェース（Python）
 ```python
 from datasets import Dataset
-from transformers import PreTrainedTokenizer
 
 def load_and_process_dataset(
     file_path: str,
-    tokenizer: PreTrainedTokenizer,
-    max_length: int = 512,
 ) -> Dataset:
     """
-    JSONL ファイルを読み込み、チャットテンプレートを適用してトークナイズした Dataset を返す。
+    JSONL ファイルを読み込み、各サンプルを {"messages": [...]} 形式に変換した Dataset を返す。
     必須フィールド欠落サンプルはスキップし、警告をログに出力する。
+    トークナイズは SFTTrainer が max_seq_length に基づき内部で実施する。
 
     Raises:
         FileNotFoundError: file_path が存在しない場合
@@ -487,12 +539,12 @@ def format_sample_as_messages(sample: dict[str, str]) -> list[dict[str, str]]:
     """
     ...
 ```
-- 事前条件: `file_path` が有効な JSONL ファイルであること；`tokenizer` がチャットテンプレートを持つこと
-- 事後条件: 返される `Dataset` は `input_ids`, `attention_mask`, `labels` フィールドを持つ
+- 事前条件: `file_path` が有効な JSONL ファイルであること
+- 事後条件: 返される `Dataset` は `messages` カラムを持ち、各要素が `list[{"role": str, "content": str}]` 形式である
 - 不変条件: `input` フィールドが空文字または省略された場合は `instruction` のみを user コンテンツとして使用
 
 **実装ノート**
-- 統合: `trl.SFTTrainer` は Dataset をそのまま受け付けるため、前処理後の Dataset を直接渡す
+- 統合: `SFTTrainer` に渡す際は `dataset_text_field` を指定せず、messages 形式を自動認識させる。`max_length` のトランケートは `SFTConfig(max_seq_length=config.data.max_length)` で指定する
 - バリデーション: 各サンプルに `instruction` と `output` の存在を確認；欠落時は `logging.warning` でサンプルインデックスを出力してスキップ
 
 ---
@@ -503,20 +555,20 @@ def format_sample_as_messages(sample: dict[str, str]) -> list[dict[str, str]]:
 
 | フィールド | 詳細 |
 |-----------|------|
-| Intent | 学習パイプライン全体をオーケストレーションし、TensorBoard ログとチェックポイントを管理する |
-| 要件 | 3.4, 5.1, 5.2, 5.3, 5.4, 9.1, 9.2, 9.3, 9.4, 10.1 |
+| Intent | 学習パイプラインのエントリポイントとして TrainingCore を呼び出し、チェックポイント保存・モデルマージ・推論デモを管理する |
+| 要件 | 5.1, 5.2, 5.3, 5.4, 9.1, 9.2, 9.3, 9.4, 10.1 |
 
 **責務と制約**
-- `OfflineGuard`, `ConfigManager`, `ModelLoader`, `DatasetProcessor` を呼び出して学習を実行
-- `trl.SFTTrainer` + `trl.SFTConfig` を使用して学習ループを実行
-- `SFTConfig(report_to=["tensorboard"], logging_dir=config.logging_dir)` で TensorBoard を有効化
-- 指定ステップ/エポック毎に LoRA アダプターを `PeftModel.save_pretrained()` で保存
-- `--merge` フラグ指定時に `merge_and_unload()` で完全モデルを保存
+- `OfflineGuard`, `ConfigManager` を呼び出した後、`TrainingCore.run_training_trial()` に委譲して学習を実行
+- `SFTConfig(report_to=["tensorboard"], logging_dir=config.logging_dir)` で TensorBoard を有効化（TrainingCore 経由で設定）
+- 学習完了後に LoRA アダプターを `PeftModel.save_pretrained()` で保存
+- `--merge` フラグ指定時に `ModelLoader.merge_and_save()` で完全モデルを保存
 - 学習後にサンプルプロンプトで推論を実行してデモ出力
 
 **依存関係**
-- 内部: OfflineGuard, ConfigManager, ModelLoader, DatasetProcessor（P0）
-- 外部: `trl` — `SFTTrainer`, `SFTConfig`（P0）
+- 内部: OfflineGuard, ConfigManager（P0）
+- 内部: TrainingCore — 学習ループ実行（P0）
+- 内部: ModelLoader — マージ処理（P1、`--merge` 指定時のみ）
 
 **契約**: バッチ [x]
 
@@ -527,7 +579,7 @@ def format_sample_as_messages(sample: dict[str, str]) -> list[dict[str, str]]:
 - 冪等性: 同一 `output_dir` への再実行は上書き（再現性のためバージョン管理推奨）
 
 **実装ノート**
-- 統合: `SFTConfig` に `gradient_checkpointing`、`per_device_train_batch_size`、`gradient_accumulation_steps`、`logging_steps`、`save_steps`、`eval_steps`、`num_train_epochs` を `TrainConfig` から展開して渡す
+- 統合: `TrainingCore.run_training_trial(config)` を呼び出し、返された `TrialResult.model_path` からアダプターを管理する
 - リスク: `output_dir` が存在しない場合は `Path(output_dir).mkdir(parents=True, exist_ok=True)` で自動作成
 
 ---
@@ -548,7 +600,8 @@ def format_sample_as_messages(sample: dict[str, str]) -> list[dict[str, str]]:
 - 探索完了後に最良パラメータを `best_params.yaml` に出力
 
 **依存関係**
-- 内部: OfflineGuard, ConfigManager, ModelLoader, DatasetProcessor（P0）
+- 内部: OfflineGuard, ConfigManager（P0）
+- 内部: TrainingCore — 各トライアルの学習実行と eval loss 取得（P0）
 - 外部: `optuna` — Study, Trial（P0、デフォルト）
 - 外部: `ray[tune]` — TuneConfig, OptunaSearch（P1、オプション）
 
@@ -804,7 +857,8 @@ slm-finetuning/
 │   │   └── loader.py            # ModelLoader
 │   ├── training/
 │   │   ├── __init__.py
-│   │   └── config.py            # ConfigManager + データクラス
+│   │   ├── config.py            # ConfigManager + データクラス（TrainConfig など）
+│   │   └── trainer.py           # TrainingCore（run_training_trial）
 │   └── utils/
 │       ├── __init__.py
 │       └── offline.py           # OfflineGuard
