@@ -1,0 +1,38 @@
+# sarashina-finetune 学習設定テンプレート
+# 使用例: python scripts/train.py --config configs/train_config.yaml
+
+# モデル設定
+model_path: "/path/to/sarashina-2.2-3b"  # ローカルモデルパスを指定
+output_dir: "outputs/sarashina-ft"
+
+# 学習ハイパーパラメータ
+learning_rate: 1.0e-4
+num_train_epochs: 3
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
+gradient_checkpointing: true
+logging_steps: 10
+save_steps: 100
+eval_steps: 100
+logging_dir: "runs/"
+report_to:
+  - "tensorboard"
+
+# LoRA 設定
+lora:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "v_proj"
+    - "k_proj"
+    - "o_proj"
+  bias: "none"
+  use_qlora: false  # true にすると 4-bit 量子化 (QLoRA) を有効化
+
+# データ設定
+data:
+  train_file: "data/dummy_train.jsonl"
+  eval_file: "data/dummy_eval.jsonl"
+  max_length: 512

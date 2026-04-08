@@ -1,0 +1,58 @@
+# HPO（ハイパーパラメータ最適化）設定ファイル
+
+# ベース学習設定（全トライアル共通）
+model_path: ""  # 必須: ベースモデルへのパス
+output_dir: "outputs/hpo"  # HPO 実行結果の出力先ディレクトリ
+data:
+  train_file: "data/dummy_train.jsonl"  # 学習データファイルパス
+  eval_file: "data/dummy_eval.jsonl"    # 評価データファイルパス
+  max_length: 512                        # トークンの最大シーケンス長
+
+# HPO 設定
+hpo:
+  backend: "optuna"               # 使用するバックエンド: "optuna" または "ray"
+  n_trials: 20                    # 実行するトライアル数
+  storage_path: "hpo_results/optuna.db"       # Optuna のストレージ（DB）パス
+  best_params_file: "hpo_results/best_params.yaml"  # 最良パラメータの保存先
+
+  # サーチスペース定義
+  # 各キーが最適化対象のハイパーパラメータに対応する
+  # 対応パラメータ: learning_rate, lora_r, lora_alpha, per_device_train_batch_size
+  search_space:
+    learning_rate:
+      type: "loguniform"  # 対数一様分布でサンプリング
+      low: 1.0e-5         # 下限値
+      high: 1.0e-3        # 上限値
+    lora_r:
+      type: "categorical"         # カテゴリカル（離散値）でサンプリング
+      choices: [4, 8, 16, 32]     # 候補値リスト
+    lora_alpha:
+      type: "categorical"
+      choices: [16, 32, 64]       # 候補値リスト
+    per_device_train_batch_size:
+      type: "categorical"
+      choices: [1, 2, 4]          # 候補値リスト
+
+# LoRA ベース設定（lora_r・lora_alpha はトライアルごとに上書きされる）
+lora:
+  r: 16                    # LoRA のランク（次元数）
+  lora_alpha: 32           # LoRA のスケーリング係数
+  lora_dropout: 0.05       # LoRA 層のドロップアウト率
+  target_modules:          # LoRA を適用するモジュール名
+    - "q_proj"
+    - "v_proj"
+  bias: "none"             # バイアスの扱い: "none" / "all" / "lora_only"
+  use_qlora: false         # QLoRA（量子化 LoRA）を使用するかどうか
+
+# 学習ベース設定（learning_rate・バッチサイズはトライアルごとに上書きされる）
+learning_rate: 1.0e-4              # 初期学習率
+num_train_epochs: 1                # トライアルあたりのエポック数（速度優先で 1 に設定）
+per_device_train_batch_size: 2     # デバイスあたりの学習バッチサイズ
+gradient_accumulation_steps: 4    # 勾配累積ステップ数（実効バッチサイズ = batch_size × steps）
+gradient_checkpointing: true       # 勾配チェックポイントで VRAM 使用量を削減
+logging_steps: 10                  # ログを記録するステップ間隔
+save_steps: 999999                 # HPO 中の中間チェックポイント保存を無効化
+eval_steps: 50                     # 評価を実行するステップ間隔
+report_to:
+  - "tensorboard"                  # ログ送信先（tensorboard / wandb など）
+logging_dir: "runs/hpo"           # TensorBoard ログの出力ディレクトリ

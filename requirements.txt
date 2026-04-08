@@ -1,0 +1,22 @@
+# Core ML frameworks
+torch>=2.1.0
+transformers>=4.40.0
+trl>=1.0.0
+peft>=0.11.0
+
+# Quantization (QLoRA)
+bitsandbytes>=0.43.0
+
+# HPO
+optuna>=3.6.0
+
+# Visualization
+tensorboard>=2.16.0
+
+# Data and utilities
+datasets>=2.19.0
+PyYAML>=6.0.1
+accelerate>=0.30.0
+
+# Weights & Biases (offline mode only)
+wandb>=0.17.0
